@@ -9,7 +9,10 @@ is processed, in merge order ``(observed_at, source_id, seq)``:
 * if the reading belongs to one of the rule's conditions and strictly
   breaches that condition's threshold (``value > threshold`` for ``above``,
   ``value < threshold`` for ``below``), it becomes the condition's most
-  recent *hit*;
+  recent *hit*;  a reading whose value is missing, non-numeric, boolean,
+  NaN/Infinity or an integer too large for a finite double (e.g. ``10**400``)
+  never becomes a hit -- it only advances event time, so existing hits keep
+  ageing against their windows exactly as for any other reading;
 * after updating the hit (and also for any other published reading, which
   simply advances event time), every condition must currently have a hit no
   older than its own ``window_seconds`` measured against the reading's event

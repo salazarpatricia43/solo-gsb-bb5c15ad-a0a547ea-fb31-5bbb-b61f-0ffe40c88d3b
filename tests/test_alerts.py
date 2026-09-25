@@ -581,3 +581,104 @@ class TestHistoryPagination:
         assert client.get("/sessions/nope/alerts/history").status_code == 404
         assert client.get("/sessions/nope/alerts/current").status_code == 404
         assert client.get("/sessions/nope/alert-rules").status_code == 404
+
+
+class TestHugeIntegerValues:
+    """JSON integers too large for a finite double (e.g. 10**400).
+
+    They are stored, published and deduplicated like any other reading, but
+    they are invalid *alert* values: they reset the streak without producing
+    enter/recover events, and they never crash the publish transaction or a
+    rule-creation replay.
+    """
+
+    BIG = 10**400
+
+    def test_stored_published_and_deduped_without_rules(self, client):
+        sid = create_session(client)
+        seq: dict = {}
+        push(client, sid, 1, {"a": self.BIG, "b": 0}, seq)
+        # The batch that publishes the huge-integer reading commits in full.
+        r = push(client, sid, 2, {"a": 1, "b": 1}, seq)
+        assert r.status_code == 200
+        assert r.json()["published_now"] == 2
+        stream = client.get(f"/sessions/{sid}/stream").json()["readings"]
+        assert [(x["source_id"], x["seq"]) for x in stream] == [("a", 1), ("b", 1)]
+        # The payload round-trips as the original JSON integer.
+        assert stream[0]["value"] == self.BIG
+        # Same key + same payload -> idempotent duplicate (dedup by payload).
+        r = report(client, sid, [{"source_id": "a", "seq": 1,
+                                  "observed_at": at(1), "value": self.BIG}])
+        assert r.status_code == 200
+        assert r.json()["duplicates"] == 1
+        # Same key + different payload -> 409.
+        r = report(client, sid, [{"source_id": "a", "seq": 1,
+                                  "observed_at": at(1), "value": 10**399}])
+        assert r.status_code == 409
+
+    def test_resets_enter_streak_without_entering(self, client):
+        sid = create_session(client)
+        rid = make_rule(client, sid, enter=10, recover=5,
+                        enter_n=2, recover_n=1)["rule_id"]
+        seq: dict = {}
+        push(client, sid, 1, {"a": 11, "b": 0}, seq)
+        push(client, sid, 2, {"a": self.BIG, "b": 0}, seq)  # publishes t1: streak 1
+        r = push(client, sid, 3, {"a": 11, "b": 0}, seq)    # publishes t2: reset
+        assert r.status_code == 200 and r.json()["published_now"] == 2
+        push(client, sid, 4, {"a": 11, "b": 0}, seq)        # publishes t3: streak 1
+        rule = client.get(f"/sessions/{sid}/alert-rules/{rid}").json()
+        # The huge integer broke the run: 11, BIG, 11 is not two consecutive
+        # breaches, so the rule never entered.
+        assert rule["state"] == "normal"
+        assert rule["streak"] == 1
+        assert current(client, sid) == []
+        assert history(client, sid) == []
+        # One more consecutive breach completes the pair and enters.
+        push(client, sid, 5, {"a": 0, "b": 0}, seq)         # publishes t4: entered
+        assert [x["rule_id"] for x in current(client, sid)] == [rid]
+
+    def test_resets_recovery_streak_without_recovering(self, client):
+        sid = create_session(client)
+        rid = make_rule(client, sid, enter=10, recover=5,
+                        enter_n=1, recover_n=2)["rule_id"]
+        seq: dict = {}
+        push(client, sid, 1, {"a": 11, "b": 0}, seq)
+        push(client, sid, 2, {"a": 1, "b": 0}, seq)          # publishes t1: entered
+        push(client, sid, 3, {"a": self.BIG, "b": 0}, seq)   # publishes t2: rec. streak 1
+        push(client, sid, 4, {"a": 1, "b": 0}, seq)          # publishes t3: reset
+        rule = client.get(f"/sessions/{sid}/alert-rules/{rid}").json()
+        # The huge integer is not a recovery reading: still active, streak 0.
+        assert rule["state"] == "active"
+        assert rule["streak"] == 0
+        push(client, sid, 5, {"a": 1, "b": 0}, seq)          # publishes t4: streak 1
+        push(client, sid, 6, {"a": 1, "b": 0}, seq)          # publishes t5: recovered
+        rule = client.get(f"/sessions/{sid}/alert-rules/{rid}").json()
+        assert rule["state"] == "normal"
+        assert [e["event_type"] for e in history(client, sid)] == ["recovered", "entered"]
+
+    def test_huge_int_under_value_key(self, client):
+        sid = create_session(client)
+        rid = make_rule(client, sid, enter=10, recover=5,
+                        enter_n=1, value_key="temp")["rule_id"]
+        seq: dict = {}
+        push(client, sid, 1, {"a": {"temp": self.BIG}, "b": 0}, seq)
+        push(client, sid, 2, {"a": {"temp": 1}, "b": 0}, seq)  # publishes t1
+        rule = client.get(f"/sessions/{sid}/alert-rules/{rid}").json()
+        assert rule["state"] == "normal"
+        assert rule["streak"] == 0
+        assert current(client, sid) == []
+
+    def test_late_rule_replay_resets_on_huge_int(self, client):
+        # Publish first, create the rule afterwards: the replayed machine
+        # matches the state it would have had from the start.
+        sid = create_session(client)
+        seq: dict = {}
+        push(client, sid, 1, {"a": 11, "b": 0}, seq)
+        push(client, sid, 2, {"a": self.BIG, "b": 0}, seq)
+        push(client, sid, 3, {"a": 11, "b": 0}, seq)
+        push(client, sid, 4, {"a": 0, "b": 0}, seq)  # publishes t1..t3
+        rule = make_rule(client, sid, enter=10, recover=5, enter_n=2)
+        # Replay: 11 (streak 1), BIG (reset), 11 (streak 1) -> no enter.
+        assert rule["state"] == "normal"
+        assert rule["streak"] == 1
+        assert history(client, sid) == []

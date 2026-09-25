@@ -851,3 +851,26 @@ class TestFiniteMedianHelper:
 def _reject_nonfinite(token: str):
     """``parse_constant`` hook: strict JSON must never carry NaN/Infinity."""
     raise ValueError(f"non-finite JSON token: {token}")
+
+
+class TestHugeIntegerValues:
+    """A JSON integer too large for a finite double (e.g. 10**400) is skipped
+    like any other invalid value: neither a candidate nor a neighbour."""
+
+    BIG = 10**400
+
+    def test_huge_int_value_is_skipped(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        insert_row(db_path, sid, "a", 1, "2026-01-01T10:00:00Z", 10)
+        insert_row(db_path, sid, "a", 2, "2026-01-01T10:00:10Z", 10)
+        insert_row(db_path, sid, "a", 3, "2026-01-01T10:00:20Z", self.BIG)
+        insert_row(db_path, sid, "a", 4, "2026-01-01T10:00:30Z", 10)
+        insert_row(db_path, sid, "a", 5, "2026-01-01T10:00:40Z", 10)
+        r = call(c, sid, source="a", window="60", sensitivity="3")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["readings_count"] == 5
+        assert body["valid_count"] == 4
+        assert body["insufficient_neighbors_count"] == 0
+        assert body["spikes"] == []

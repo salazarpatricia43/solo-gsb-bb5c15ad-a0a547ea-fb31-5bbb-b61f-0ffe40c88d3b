@@ -108,7 +108,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 422 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 433 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -162,7 +162,9 @@ pytest -q        # 运行 422 个端到端行为测试（需 pytest、httpx）
   `recover_threshold > enter_threshold`；落在两个阈值之间（滞回带内）的读数不越限也不恢复，
   只会把当前连续计数清零。阈值比较是**严格**的，恰好等于阈值的读数不计入。
 - 非数值（字符串、布尔、NaN/Infinity）、缺失值或指定了 `value_key` 但对象里没有该键时，
-  该读数只会重置连续计数，不产生事件、不改变状态。
+  该读数只会重置连续计数，不产生事件、不改变状态。**无法表示为有限浮点数的 JSON 整数**
+  （如 `10^400`）同样按无效告警值处理：读数本身照常入库、发布与判重，但它不越限也不恢复，
+  只会把当前连续计数清零——不会导致发布事务回滚或规则创建回放失败。
 - **只有确定发布的读数才推进状态**：缓冲中的读数不参与；因迟到进入隔离区的读数状态永远是
   `quarantined`，不可能被状态机看到，因此**绝不会改变告警状态或补造事件**。
 - **按来源独立**：不同来源（以及同一来源上的多条规则）各自维护独立的状态与连续计数。
@@ -181,7 +183,9 @@ seq)`），而不仅是条件来源的读数：
 
 - 每处理一条确定发布的读数，若它属于某个条件且**严格越限**（`above`：`value > threshold`；
   `below`：`value < threshold`，相等不算），就刷新该条件的“最近命中”（记录 `seq`、
-  `observed_at`、`value`）。非数值、布尔、NaN/Infinity、缺值或缺键的读数不会命中。
+  `observed_at`、`value`）。非数值、布尔、NaN/Infinity、缺值或缺键的读数不会命中；
+  **无法表示为有限浮点数的 JSON 整数**（如 `10^400`）同样不记作命中——它只推进事件时间，
+  既有命中仍按各自的 `window_seconds` 随事件时间正常过期。
 - 每次处理后（也包括不属于任何条件的来源读数——它们只推进事件时间）检查：每个条件都存在
   命中，且命中时间与当前读数事件时间之差 **≤ 各自的 `window_seconds`**（窗口边界**含等号**，
   恰好在界上仍然有效）。
@@ -911,6 +915,7 @@ curl -s 'localhost:8000/sessions/lab-1/arrival-latency?from=2026-09-21T10:00:00Z
   其余（恰好等于阈值也算）计入有效但不超阈的覆盖时间；二者之和为 `covered_seconds`。
 - **缺值（null）、非有限数值（NaN/Infinity）与布尔值形成未知区间**：从该读数时刻起到
   下一条读数为止都是未知，**不会沿用更早的有效值**；非数值字符串、对象取值缺键同理。
+  无法表示为有限浮点数的 JSON 整数（如 `10^400`）也按无效值处理，形成未知区间。
 - 起点继承到的最近读数若本身无效，区间起点同样是未知。
 - `ratio_above = above_threshold_seconds / covered_seconds`；`covered_seconds` 为 0
   （全程未知）时为 `null`。
@@ -967,6 +972,7 @@ UTC 形式（如 `...T12:00:00+02:00` 回显为 `...T10:00:00Z`，不带时区�
 **有效读数与稳定排序**：区间内读数按 `(observed_at, seq)` 稳定排序（同一事件时刻按
 `seq` 破并）。只有**有限的非布尔数值**参与：给了 `value_key` 时从对象型读数读取该顶层键，
 键缺失、值为布尔/字符串/`null`/NaN/Infinity，或读数本身不是带该键的对象，一律跳过；
+无法表示为有限浮点数的 JSON 整数（如 `10^400`）同样跳过。
 不给 `value_key` 时读数 `value` 本身须为有限非布尔数值。被跳过的读数既不是候选也不是
 邻居。
 
@@ -1136,8 +1142,8 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   └── config.py        # 环境变量配置
 ├── tests/
 │   ├── test_api.py          # 时间线/隔离/幂等等端到端行为测试（22 个）
-│   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
-│   ├── test_correlated.py   # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
+│   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页/超大整数无效值测试（32 个）
+│   ├── test_correlated.py   # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移/超大整数不记命中测试（38 个）
 │   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
 │   ├── test_checkpoints.py  # 检查点创建/幂等（含清理交错）/409/继续读取分页/不可变/迁移测试（45 个）
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
@@ -1146,8 +1152,8 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/跨轮清理/过滤/400/只读测试（45 个）
 │   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（30 个）
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
-│   └── test_exposure.py   # 阈值暴露时长：持有语义/起点继承/同刻 seq/未知区间/value_key/只看已发布/400/只读/单快照测试（47 个）
-│   └── test_local_spikes.py # 局部尖峰：中位数/MAD/严格判定/MAD 为零/邻居窗口与下限/闭区间/value_key/200 上限/400/只读/单快照/偶数项中位数与 MAD 防溢出（1e308）测试（60 个）
+│   └── test_exposure.py   # 阈值暴露时长：持有语义/起点继承/同刻 seq/未知区间（含超大整数）/value_key/只看已发布/400/只读/单快照测试（49 个）
+│   └── test_local_spikes.py # 局部尖峰：中位数/MAD/严格判定/MAD 为零/邻居窗口与下限/闭区间/value_key/200 上限/400/只读/单快照/偶数项中位数与 MAD 防溢出（1e308）/超大整数跳过测试（61 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

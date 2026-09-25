@@ -14,7 +14,10 @@ two-state machine over that source's **published** readings only:
 The enter/recover thresholds form a hysteresis band so that a value jittering
 around a single boundary cannot flap the state. Readings inside the band,
 non-numeric values, or missing values reset the current streak but never
-change the state.
+change the state.  A JSON integer too large to convert to a finite double
+(e.g. ``10**400``) is likewise an invalid alert value: the reading itself is
+stored and published like any other, but no threshold comparison is
+meaningful for it, so it only resets the streak.
 
 The machine is a pure function of the published timeline in deterministic
 order ``(observed_at, source_id, seq)``: buffered readings do not advance it
@@ -102,6 +105,10 @@ def extract_numeric(payload: Optional[str], value_key: Optional[str]) -> Optiona
     With ``value_key=None`` the reading value itself must be numeric;
     otherwise the top-level object key is read.  Missing keys, non-numeric
     payloads, booleans and NaN/Infinity all yield ``None`` (streak reset).
+    A JSON integer beyond the finite-double range (e.g. ``10**400``) also
+    yields ``None``: the reading is stored and published normally, but it
+    cannot be compared against any finite threshold, so it is an invalid
+    alert value rather than an error.
     """
     if payload is None:
         return None
@@ -117,7 +124,13 @@ def extract_numeric(payload: Optional[str], value_key: Optional[str]) -> Optiona
     # not a meaningful breach).
     if isinstance(data, bool) or not isinstance(data, (int, float)):
         return None
-    number = float(data)
+    try:
+        number = float(data)
+    except OverflowError:
+        # An integer this large has no finite-double representation; without
+        # this guard the conversion would raise and roll back the whole
+        # ingest/publish transaction (or fail a rule-creation replay).
+        return None
     return number if math.isfinite(number) else None
 
 

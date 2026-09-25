@@ -611,3 +611,33 @@ class TestReadOnlySnapshot:
         body = ex(c, sid)
         assert body["above_threshold_seconds"] == 30.0
         assert body["covered_seconds"] == 60.0
+
+
+class TestHugeIntegerValues:
+    """A JSON integer too large for a finite double (e.g. 10**400) is not a
+    valid sample: it forms an unknown stretch instead of crashing the read."""
+
+    BIG = 10**400
+
+    def test_huge_int_value_is_unknown_not_above(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        insert_row(db_path, sid, "a", 1, "2026-01-01T10:00:00Z", 20)
+        insert_row(db_path, sid, "a", 2, "2026-01-01T10:00:30Z", self.BIG)
+        body = ex(c, sid, source="a", threshold="10")
+        # [00,30) is above; [30,60) is unknown -- the huge integer neither
+        # counts as covered nor carries the earlier valid value forward.
+        assert body["above_threshold_seconds"] == 30.0
+        assert body["covered_seconds"] == 30.0
+        assert body["unknown_seconds"] == 30.0
+        assert body["ratio_above"] == 1.0
+
+    def test_huge_int_under_value_key_is_unknown(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        insert_row(db_path, sid, "a", 1, "2026-01-01T10:00:00Z",
+                   {"temp": self.BIG})
+        body = ex(c, sid, source="a", threshold="10", value_key="temp")
+        assert body["covered_seconds"] == 0.0
+        assert body["unknown_seconds"] == 60.0
+        assert body["ratio_above"] is None

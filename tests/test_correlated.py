@@ -715,3 +715,89 @@ class TestMigrations:
                 ]
             })
             assert r.status_code == 201, r.text
+
+
+class TestHugeIntegerValues:
+    """JSON integers too large for a finite double (e.g. 10**400).
+
+    They are stored and published like any other reading, but they never
+    count as a condition hit; they only advance event time, so existing hits
+    keep ageing against their windows exactly as for any other reading.
+    """
+
+    BIG = 10**400
+
+    def test_huge_int_is_not_a_hit(self, client):
+        sid = create_session(client)
+        rule = make_corr_rule(client, sid, [
+            cond("a", threshold=10, window=100),
+            cond("b", threshold=10, window=100),
+        ])
+        seq: dict = {}
+        sources = ("a", "b")
+        push(client, sid, 1, {"a": self.BIG}, seq, sources)
+        # Publishes t1: the huge integer does not hit condition a.
+        r = push(client, sid, 2, {"b": 11}, seq, sources)
+        assert r.status_code == 200 and r.json()["published_now"] == 2
+        # Publishes t2: b hits, but a still has no hit -> waiting.
+        push(client, sid, 3, {}, seq, sources)
+        assert current(client, sid) == []
+        assert history(client, sid) == []
+        rule = client.get(f"/sessions/{sid}/correlated-rules/{rule['rule_id']}").json()
+        assert rule["state"] == "waiting"
+        by_source = {c["source_id"]: c for c in rule["conditions"]}
+        assert by_source["a"]["last_hit"] is None
+        assert by_source["b"]["last_hit"]["value"] == 11.0
+
+    def test_existing_hits_keep_ageing_across_huge_int(self, client):
+        sid = create_session(client, sources=["a", "b", "c"])
+        rule = make_corr_rule(client, sid, [
+            cond("a", threshold=10, window=5),
+            cond("b", threshold=10, window=5),
+        ])
+        seq: dict = {}
+        sources = ("a", "b", "c")
+        push(client, sid, 1, {"a": 11, "b": 11}, seq, sources)
+        # Publishes t1: both hit -> correlated_entered anchored at b@1.
+        push(client, sid, 2, {}, seq, sources)
+        assert len(current(client, sid)) == 1
+        # t3 carries the huge integer on a: not a hit, but event time moves.
+        push(client, sid, 3, {"a": self.BIG}, seq, sources)
+        # Publishes t3: hits from t1 are 2s old (<= 5s) -> still correlated.
+        push(client, sid, 4, {}, seq, sources)
+        assert len(current(client, sid)) == 1
+        # Publishes t8: hits are 7s old (> 5s) -> silently back to waiting.
+        push(client, sid, 8, {}, seq, sources)
+        push(client, sid, 9, {}, seq, sources)
+        assert current(client, sid) == []
+        rule = client.get(f"/sessions/{sid}/correlated-rules/{rule['rule_id']}").json()
+        assert rule["state"] == "waiting"
+        # The huge integer never replaced the t1 hit on condition a.
+        by_source = {c["source_id"]: c for c in rule["conditions"]}
+        assert by_source["a"]["last_hit"]["seq"] == 1
+        assert by_source["a"]["last_hit"]["value"] == 11.0
+        # Exactly one event for the whole run (no duplicate, none from BIG).
+        events = history(client, sid)
+        assert len(events) == 1
+        assert events[0]["completed_by"] == {
+            "source_id": "b", "seq": 1, "observed_at": at(1),
+        }
+
+    def test_late_rule_replay_skips_huge_int(self, client):
+        # Publish first, create the rule afterwards: the replay treats the
+        # huge integer as a non-hit and never fails.
+        sid = create_session(client)
+        seq: dict = {}
+        sources = ("a", "b")
+        push(client, sid, 1, {"a": self.BIG}, seq, sources)
+        push(client, sid, 2, {"b": 11}, seq, sources)
+        push(client, sid, 3, {}, seq, sources)  # publishes t1..t2
+        rule = make_corr_rule(client, sid, [
+            cond("a", threshold=10, window=100),
+            cond("b", threshold=10, window=100),
+        ])
+        assert rule["state"] == "waiting"
+        by_source = {c["source_id"]: c for c in rule["conditions"]}
+        assert by_source["a"]["last_hit"] is None
+        assert by_source["b"]["last_hit"]["value"] == 11.0
+        assert history(client, sid) == []
