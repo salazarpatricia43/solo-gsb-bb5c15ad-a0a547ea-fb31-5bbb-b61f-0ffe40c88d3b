@@ -102,6 +102,13 @@ def extract_numeric(payload: Optional[str], value_key: Optional[str]) -> Optiona
     With ``value_key=None`` the reading value itself must be numeric;
     otherwise the top-level object key is read.  Missing keys, non-numeric
     payloads, booleans and NaN/Infinity all yield ``None`` (streak reset).
+
+    JSON integers have arbitrary precision in Python, so a value such as
+    ``10**400`` ingests and stores fine but cannot be converted to a finite
+    double (``float()`` raises ``OverflowError``).  Such an integer has no
+    meaning against finite thresholds either, so it is treated as any other
+    invalid alert value (``None``) instead of aborting the publish
+    transaction -- the reading itself stays stored and published.
     """
     if payload is None:
         return None
@@ -117,7 +124,12 @@ def extract_numeric(payload: Optional[str], value_key: Optional[str]) -> Optiona
     # not a meaningful breach).
     if isinstance(data, bool) or not isinstance(data, (int, float)):
         return None
-    number = float(data)
+    try:
+        number = float(data)
+    except OverflowError:
+        # Integer outside the finite double range (e.g. 10**400): an invalid
+        # alert value, never an error that rolls the whole batch back.
+        return None
     return number if math.isfinite(number) else None
 
 
